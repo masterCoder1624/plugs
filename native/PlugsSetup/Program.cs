@@ -46,6 +46,25 @@ try
     var manifest = await ReadManifestAsync(http);
 
     Console.WriteLine($"Latest version: {manifest.Version}");
+    var installedVersionPath = Path.Combine(installDir, "installed-version.json");
+    var installedVersion = ReadInstalledVersion(installedVersionPath);
+    var existingLauncherExe = Path.Combine(installDir, "plugs", "Plugs.exe");
+
+    if (File.Exists(existingLauncherExe) &&
+        string.Equals(installedVersion, manifest.Version, StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"Plugs {installedVersion} is already installed.");
+        Console.WriteLine("Starting existing app...");
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = existingLauncherExe,
+            WorkingDirectory = Path.GetDirectoryName(existingLauncherExe)!,
+            UseShellExecute = true,
+        });
+
+        return;
+    }
 
     Console.WriteLine("[2/5] Downloading Plugs package...");
     await DownloadFileAsync(http, manifest.DownloadUrl, zipPath);
@@ -90,31 +109,16 @@ try
         !previousConfig.Contains("PASTE_MONGODB_ATLAS_URI_HERE", StringComparison.OrdinalIgnoreCase))
     {
         File.WriteAllText(configPath, previousConfig);
-        Console.WriteLine("Existing MongoDB Atlas config preserved.");
+        Console.WriteLine("Existing config preserved.");
+    }
+    else if (File.Exists(configPath) &&
+            !File.ReadAllText(configPath).Contains("PASTE_MONGODB_ATLAS_URI_HERE", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine("Bundled config found.");
     }
     else
     {
-        Console.WriteLine();
-        Console.WriteLine("MongoDB Atlas is used for storage.");
-        Console.Write("Paste MongoDB Atlas URI, or press Enter to add it later: ");
-        var mongoUri = Console.ReadLine();
-
-        if (string.IsNullOrWhiteSpace(mongoUri))
-        {
-            mongoUri = "PASTE_MONGODB_ATLAS_URI_HERE";
-        }
-
-        var config = new
-        {
-            backendHost = "127.0.0.1",
-            backendPort = 8000,
-            mongoUri
-        };
-
-        File.WriteAllText(
-            configPath,
-            JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true })
-        );
+        Console.WriteLine("Config created from bundled package.");
     }
 
     File.WriteAllText(
@@ -226,6 +230,29 @@ static async Task DownloadFileAsync(HttpClient http, string url, string destinat
     }
 
     Console.WriteLine();
+}
+
+static string? ReadInstalledVersion(string installedVersionPath)
+{
+    try
+    {
+        if (!File.Exists(installedVersionPath))
+        {
+            return null;
+        }
+
+        using var document = JsonDocument.Parse(File.ReadAllText(installedVersionPath));
+        if (document.RootElement.TryGetProperty("version", out var version))
+        {
+            return version.GetString();
+        }
+
+        return null;
+    }
+    catch
+    {
+        return null;
+    }
 }
 
 static string ComputeSha256(string filePath)
