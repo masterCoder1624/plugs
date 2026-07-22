@@ -43,10 +43,27 @@ if (Test-Path $GeneratedExe) {
 Write-Host "[4/5] Copying bundled Playwright browsers when available..."
 $LocalBrowsers = Join-Path $env:LOCALAPPDATA "ms-playwright"
 if (Test-Path $LocalBrowsers) {
-    Copy-Item -LiteralPath $LocalBrowsers -Destination (Join-Path $ReleaseRoot "browsers") -Recurse -Force
+    $BrowserDest = Join-Path $ReleaseRoot "browsers"
+    New-Item -ItemType Directory -Path $BrowserDest -Force | Out-Null
+
+    $Chromium = Get-ChildItem -LiteralPath $LocalBrowsers -Directory |
+        Where-Object { $_.Name -match '^chromium-\d+$' } |
+        Sort-Object Name -Descending |
+        Select-Object -First 1
+
+    if (-not $Chromium) {
+        throw "No bundled Chromium browser found in $LocalBrowsers. Run: python -m playwright install chromium"
+    }
+
+    Copy-Item -LiteralPath $Chromium.FullName -Destination $BrowserDest -Recurse -Force
+
+    $LinksDir = Join-Path $LocalBrowsers ".links"
+    if (Test-Path $LinksDir) {
+        Copy-Item -LiteralPath $LinksDir -Destination $BrowserDest -Recurse -Force
+    }
 } else {
     Write-Host "No local Playwright browsers found at $LocalBrowsers"
-    Write-Host "Run: python -m playwright install"
+    Write-Host "Run: python -m playwright install chromium"
 }
 
 $ConfigTemplate = @{
