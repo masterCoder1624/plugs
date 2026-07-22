@@ -1,0 +1,30 @@
+{
+  "name": "plugs",
+  "version": "0.1.0",
+  "description": "Launcher for the Plugs job-scraper: starts the Python/FastAPI backend and the Flutter desktop app.",
+  "bin": {
+    "plugs": "./cli.js"
+  },
+  "scripts": {
+    "postinstall": "node ./postinstall.js",
+    "pack:check": "npm pack --dry-run"
+  },
+  "files": [
+    "bootstrap.ps1",
+    "cli.js",
+    "launcher.js",
+    "install.js",
+    "postinstall.js",
+    "backend/app.py",
+    "backend/scraper.py",
+    "backend/requirements.txt",
+    "flutter/Plugs.exe",
+    "flutter/flutter_windows.dll",
+    "flutter/data/**/*",
+    "README.md"
+  ],
+  "dependencies": {},
+  "engines": {
+    "node": ">=16"
+  }
+}

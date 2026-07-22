@@ -1,0 +1,35 @@
+# Development source/build folders
+flutter_app/
+LinkedIn_Job_Scrapper/
+
+# Python generated files
+__pycache__/
+*.pyc
+backend/__pycache__/
+backend/output/
+
+# Private login/session files
+backend/linkedin_session.json
+LinkedIn_Job_Scrapper/linkedin_session.json
+
+# Local runtime folders
+logs/
+config/
+
+# Flutter build source caches
+.dart_tool/
+build/
+
+# Git/editor files
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Native/build/release files
+native/
+dist/
+build/
+.dotnet/
+.nuget/
+.appdata/

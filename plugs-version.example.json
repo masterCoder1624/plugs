@@ -1,0 +1,6 @@
+{
+  "version": "0.1.0",
+  "downloadUrl": "https://github.com/masterCoder1624/plugs/releases/download/v0.1.0/plugs-windows.zip",
+  "sha256": "PUT_RELEASE_ZIP_SHA256_HERE",
+  "notes": "Initial compiled desktop release."
+}
