@@ -6,6 +6,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 const string VersionManifestUrl = "https://raw.githubusercontent.com/masterCoder1624/plugs/main/plugs-version.json";
+const string BundledManifestJson = """
+{
+  "version": "0.1.0",
+  "downloadUrl": "https://github.com/masterCoder1624/plugs/releases/download/v0.1.0/plugs-windows.zip",
+  "sha256": "EBD92FA8774640E75B1A660F4D15F4788958979D314C7EABD489922CBE1E203C",
+  "notes": "Initial compiled desktop release."
+}
+""";
 
 var installDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -13,6 +21,7 @@ var installDir = Path.Combine(
 );
 var tempDir = Path.Combine(Path.GetTempPath(), "plugs-installer");
 var zipPath = Path.Combine(tempDir, "plugs-windows.zip");
+var setupLogPath = Path.Combine(tempDir, "setup-error.log");
 
 Console.Title = "Plugs Setup";
 Console.WriteLine();
@@ -32,18 +41,14 @@ try
         : null;
 
     Console.WriteLine("[1/5] Reading latest version...");
-    using var http = new HttpClient();
-    var manifest = await http.GetFromJsonAsync<VersionManifest>(VersionManifestUrl)
-        ?? throw new InvalidOperationException("Could not read Plugs version manifest.");
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+    http.DefaultRequestHeaders.UserAgent.ParseAdd("PlugsSetup/0.1.0");
+    var manifest = await ReadManifestAsync(http);
 
     Console.WriteLine($"Latest version: {manifest.Version}");
 
     Console.WriteLine("[2/5] Downloading Plugs package...");
-    await using (var download = await http.GetStreamAsync(manifest.DownloadUrl))
-    await using (var file = File.Create(zipPath))
-    {
-        await download.CopyToAsync(file);
-    }
+    await DownloadFileAsync(http, manifest.DownloadUrl, zipPath);
 
     if (!string.IsNullOrWhiteSpace(manifest.Sha256))
     {
@@ -136,10 +141,91 @@ catch (Exception error)
 {
     Console.Error.WriteLine();
     Console.Error.WriteLine("Plugs setup failed:");
+    Console.Error.WriteLine(error.GetType().Name);
     Console.Error.WriteLine(error.Message);
     Console.Error.WriteLine();
+    Console.Error.WriteLine($"Error log: {setupLogPath}");
     Console.Error.WriteLine("If this keeps failing, install from the latest GitHub release manually.");
+    Console.Error.WriteLine();
+    Console.Error.WriteLine("Press Enter to close this window.");
+
+    try
+    {
+        Directory.CreateDirectory(tempDir);
+        File.WriteAllText(setupLogPath, error.ToString());
+    }
+    catch
+    {
+        // Best-effort logging only.
+    }
+
+    Console.ReadLine();
     Environment.Exit(1);
+}
+
+static async Task<VersionManifest> ReadManifestAsync(HttpClient http)
+{
+    try
+    {
+        var manifest = await http.GetFromJsonAsync<VersionManifest>(VersionManifestUrl)
+            ?? throw new InvalidOperationException("Could not read Plugs version manifest.");
+
+        if (string.IsNullOrWhiteSpace(manifest.DownloadUrl))
+        {
+            throw new InvalidOperationException("Plugs version manifest did not contain a download URL.");
+        }
+
+        return manifest;
+    }
+    catch (Exception error)
+    {
+        Console.WriteLine($"Could not read latest version online: {error.Message}");
+        Console.WriteLine("Using bundled release information instead.");
+
+        return JsonSerializer.Deserialize<VersionManifest>(BundledManifestJson)
+            ?? throw new InvalidOperationException("Bundled Plugs version manifest is invalid.");
+    }
+}
+
+static async Task DownloadFileAsync(HttpClient http, string url, string destinationPath)
+{
+    using var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+    response.EnsureSuccessStatusCode();
+
+    var totalBytes = response.Content.Headers.ContentLength;
+    await using var download = await response.Content.ReadAsStreamAsync();
+    await using var file = File.Create(destinationPath);
+
+    var buffer = new byte[1024 * 128];
+    long copiedBytes = 0;
+    var lastProgressAt = DateTimeOffset.MinValue;
+
+    while (true)
+    {
+        var read = await download.ReadAsync(buffer);
+        if (read == 0)
+        {
+            break;
+        }
+
+        await file.WriteAsync(buffer.AsMemory(0, read));
+        copiedBytes += read;
+
+        if (DateTimeOffset.UtcNow - lastProgressAt > TimeSpan.FromMilliseconds(750))
+        {
+            lastProgressAt = DateTimeOffset.UtcNow;
+            if (totalBytes.HasValue)
+            {
+                Console.Write($"\rDownloaded {copiedBytes / 1024 / 1024} MB of {totalBytes.Value / 1024 / 1024} MB...");
+            }
+            else
+            {
+                Console.Write($"\rDownloaded {copiedBytes / 1024 / 1024} MB...");
+            }
+        }
+    }
+
+    Console.WriteLine();
 }
 
 static string ComputeSha256(string filePath)
