@@ -1,6 +1,5 @@
-import contextlib
-import os
 import asyncio
+import os
 from collections import deque
 from datetime import datetime
 from typing import Any
@@ -8,49 +7,23 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-try:
-    import scraper
-except ImportError:
-    from . import scraper
+from outreach import OutreachService, get_mongo_client, safe_doc
 
 
-app = FastAPI(title="Plugs Backend", version="0.1.0")
+app = FastAPI(title="Plugs Outreach Backend", version="0.2.0")
 
-logs = deque(maxlen=300)
-scrape_task: asyncio.Task | None = None
+logs = deque(maxlen=500)
 
 state = {
     "status": "idle",
     "started_at": None,
     "finished_at": None,
     "error": None,
+    "current_campaign_id": None,
 }
 
+outreach_task: asyncio.Task | None = None
 
-class StartRequest(BaseModel):
-    search_urls: list[str] | None = None
-
-class LogWriter:
-    def __init__(self):
-        self.buffer = ""
-
-    def write(self, text: str):
-        if not text:
-            return
-
-        self.buffer += text
-
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
-            line = line.strip()
-
-            if line:
-                add_log(line)
-
-    def flush(self):
-        if self.buffer.strip():
-            add_log(self.buffer.strip())
-            self.buffer = ""
 
 def add_log(message: str):
     logs.append({
@@ -59,111 +32,54 @@ def add_log(message: str):
     })
 
 
+service = OutreachService(add_log)
+
+
+class ConnectLinkedInRequest(BaseModel):
+    timeout_seconds: int = 300
+
+
+class CreateCampaignRequest(BaseModel):
+    name: str = "LinkedIn Outreach Campaign"
+    search_url: str
+    daily_limit: int = 10
+    message_template: str | None = None
+
+
+class PreviewRequest(BaseModel):
+    search_url: str
+    campaign_id: str | None = None
+    limit: int = 25
+
+
+class StartOutreachRequest(BaseModel):
+    campaign_id: str
+    search_url: str
+    daily_limit: int = 10
+
+
+class CheckAcceptedRequest(BaseModel):
+    campaign_id: str
+    limit: int = 50
+
+
+class SendMessageRequest(BaseModel):
+    campaign_id: str
+    message_template: str
+    confirm_send: bool = False
+    limit: int = 10
+
+
 def json_safe(value: Any):
-    if isinstance(value, list):
-        return [json_safe(item) for item in value]
-
-    if isinstance(value, dict):
-        return {key: json_safe(val) for key, val in value.items()}
-
-    if isinstance(value, datetime):
-        return value.isoformat()
-
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-
-    return str(value)
-
-
-async def run_scraper(search_urls: list[str] | None):
-    global scrape_task
-
-    state["status"] = "running"
-    state["started_at"] = datetime.utcnow().isoformat() + "Z"
-    state["finished_at"] = None
-    state["error"] = None
-
-    add_log("Scraper started.")
-
-    log_writer = LogWriter()
-
-    try:
-        with contextlib.redirect_stdout(log_writer), contextlib.redirect_stderr(log_writer):
-            await scraper.main(search_urls=search_urls)
-
-        state["status"] = "completed"
-        add_log("Scraper completed.")
-
-    except asyncio.CancelledError:
-        state["status"] = "stopped"
-        add_log("Scraper stopped by user.")
-        raise
-
-    except Exception as error:
-        state["status"] = "failed"
-        state["error"] = str(error)
-        add_log(f"Scraper failed: {error}")
-
-    finally:
-        log_writer.flush()
-        state["finished_at"] = datetime.utcnow().isoformat() + "Z"
-        scrape_task = None
+    return safe_doc(value)
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "service": "plugs-backend",
+        "service": "plugs-outreach-backend",
         "status": state["status"],
-    }
-
-
-@app.post("/start")
-async def start(request: StartRequest):
-    global scrape_task
-
-    if scrape_task and not scrape_task.done():
-        raise HTTPException(status_code=409, detail="Scraper is already running.")
-
-    scrape_task = asyncio.create_task(run_scraper(request.search_urls))
-
-    return {
-        "ok": True,
-        "message": "Scraper started.",
-        "status": state["status"],
-    }
-
-
-@app.post("/stop")
-async def stop():
-    global scrape_task
-
-    if not scrape_task or scrape_task.done():
-        state["status"] = "idle"
-        return {
-            "ok": True,
-            "message": "No scraper is running.",
-            "status": state["status"],
-        }
-
-    state["status"] = "stopping"
-    add_log("Stop requested.")
-    scrape_task.cancel()
-
-    return {
-        "ok": True,
-        "message": "Stopping scraper.",
-        "status": state["status"],
-    }
-
-
-@app.get("/progress")
-def progress():
-    return {
-        "ok": True,
-        "state": state,
-        "running": scrape_task is not None and not scrape_task.done(),
     }
 
 
@@ -175,24 +91,222 @@ def get_logs():
     }
 
 
-@app.get("/results")
-def get_results(limit: int = 50):
+@app.get("/progress")
+def progress():
+    return {
+        "ok": True,
+        "state": state,
+        "running": outreach_task is not None and not outreach_task.done(),
+    }
+
+
+@app.post("/linkedin/connect")
+async def connect_linkedin(request: ConnectLinkedInRequest):
+    state["status"] = "connecting_linkedin"
+    add_log("LinkedIn connection started.")
+
+    result = await service.connect_linkedin(timeout_seconds=request.timeout_seconds)
+
+    state["status"] = "idle" if result.get("connected") else "linkedin_login_failed"
+
+    return result
+
+
+@app.get("/linkedin/status")
+async def linkedin_status():
+    return await service.linkedin_status()
+
+
+@app.post("/campaigns")
+def create_campaign(request: CreateCampaignRequest):
+    if not request.search_url.startswith("https://www.linkedin.com/"):
+        raise HTTPException(status_code=400, detail="Only LinkedIn URLs are allowed.")
+
+    campaign_id = service.create_campaign(
+        name=request.name,
+        search_url=request.search_url,
+        daily_limit=request.daily_limit,
+        message_template=request.message_template,
+    )
+
+    add_log(f"Campaign created: {campaign_id}")
+
+    return {
+        "ok": True,
+        "campaignId": campaign_id,
+    }
+
+
+@app.post("/campaigns/preview")
+async def preview_people(request: PreviewRequest):
+    if not request.search_url.startswith("https://www.linkedin.com/"):
+        raise HTTPException(status_code=400, detail="Only LinkedIn URLs are allowed.")
+
+    people = await service.preview_people(
+        search_url=request.search_url,
+        campaign_id=request.campaign_id,
+        limit=request.limit,
+    )
+
+    return {
+        "ok": True,
+        "people": people,
+        "count": len(people),
+    }
+
+
+async def run_outreach_task(campaign_id: str, search_url: str, daily_limit: int):
     try:
-        client = scraper.get_mongo_client()
-        collection = client[scraper.DB_LEADS][scraper.COL_REQUIREMENTS]
-        docs = list(collection.find().sort("scraped_at", -1).limit(limit))
-        client.close()
+        state["status"] = "running"
+        state["started_at"] = datetime.utcnow().isoformat() + "Z"
+        state["finished_at"] = None
+        state["error"] = None
+        state["current_campaign_id"] = campaign_id
+
+        add_log("Outreach started.")
+
+        result = await service.start_outreach(
+            campaign_id=campaign_id,
+            search_url=search_url,
+            daily_limit=daily_limit,
+        )
+
+        state["status"] = "completed"
+        add_log(f"Outreach completed: {result}")
+
+    except asyncio.CancelledError:
+        state["status"] = "stopped"
+        service.stop()
+        add_log("Outreach stopped by user.")
+        raise
+
+    except Exception as error:
+        state["status"] = "failed"
+        state["error"] = str(error)
+        add_log(f"Outreach failed: {error}")
+
+    finally:
+        state["finished_at"] = datetime.utcnow().isoformat() + "Z"
+
+
+@app.post("/campaigns/start")
+async def start_outreach(request: StartOutreachRequest):
+    global outreach_task
+
+    if outreach_task and not outreach_task.done():
+        raise HTTPException(status_code=409, detail="Outreach is already running.")
+
+    if not request.search_url.startswith("https://www.linkedin.com/"):
+        raise HTTPException(status_code=400, detail="Only LinkedIn URLs are allowed.")
+
+    outreach_task = asyncio.create_task(
+        run_outreach_task(
+            campaign_id=request.campaign_id,
+            search_url=request.search_url,
+            daily_limit=request.daily_limit,
+        )
+    )
+
+    return {
+        "ok": True,
+        "message": "Outreach started.",
+        "campaignId": request.campaign_id,
+    }
+
+
+@app.post("/campaigns/stop")
+async def stop_outreach():
+    global outreach_task
+
+    service.stop()
+
+    if outreach_task and not outreach_task.done():
+        outreach_task.cancel()
+        state["status"] = "stopping"
+        add_log("Stop requested.")
 
         return {
             "ok": True,
-            "results": json_safe(docs),
+            "message": "Stopping outreach.",
         }
-    except Exception as error:
-        return {
-            "ok": False,
-            "error": str(error),
-            "results": [],
-        }
+
+    state["status"] = "idle"
+
+    return {
+        "ok": True,
+        "message": "No outreach is running.",
+    }
+
+
+@app.post("/campaigns/check-accepted")
+async def check_accepted(request: CheckAcceptedRequest):
+    state["status"] = "checking_accepted"
+    add_log("Checking accepted connections.")
+
+    result = await service.check_accepted(
+        campaign_id=request.campaign_id,
+        limit=request.limit,
+    )
+
+    state["status"] = "idle"
+
+    return result
+
+
+@app.post("/campaigns/send-message")
+async def send_message(request: SendMessageRequest):
+    state["status"] = "sending_messages"
+    add_log("First-message flow started.")
+
+    result = await service.send_first_messages(
+        campaign_id=request.campaign_id,
+        message_template=request.message_template,
+        confirm_send=request.confirm_send,
+        limit=request.limit,
+    )
+
+    state["status"] = "idle"
+
+    return result
+
+
+@app.get("/campaigns/{campaign_id}/stats")
+def campaign_stats(campaign_id: str):
+    return service.campaign_stats(campaign_id)
+
+
+@app.get("/campaigns/{campaign_id}/invites")
+def campaign_invites(campaign_id: str, limit: int = 100):
+    client = get_mongo_client()
+    docs = list(
+        client["plugs_outreach"]["connection_invites"]
+        .find({"campaignId": campaign_id})
+        .sort("updatedAt", -1)
+        .limit(limit)
+    )
+    client.close()
+
+    return {
+        "ok": True,
+        "invites": json_safe(docs),
+    }
+
+
+@app.get("/campaigns/{campaign_id}/profiles")
+def campaign_profiles(campaign_id: str, limit: int = 100):
+    client = get_mongo_client()
+    docs = list(
+        client["plugs_outreach"]["people_profiles"]
+        .find({"campaignId": campaign_id})
+        .sort("updatedAt", -1)
+        .limit(limit)
+    )
+    client.close()
+
+    return {
+        "ok": True,
+        "profiles": json_safe(docs),
+    }
 
 
 if __name__ == "__main__":
