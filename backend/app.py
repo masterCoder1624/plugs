@@ -44,6 +44,7 @@ class CreateCampaignRequest(BaseModel):
     search_url: str
     daily_limit: int = 10
     message_template: str | None = None
+    like_post_after_invite: bool = False
 
 
 class PreviewRequest(BaseModel):
@@ -65,7 +66,7 @@ class CheckAcceptedRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     campaign_id: str
-    message_template: str
+    message_template: str | None = None
     confirm_send: bool = False
     limit: int = 10
 
@@ -127,6 +128,7 @@ def create_campaign(request: CreateCampaignRequest):
         search_url=request.search_url,
         daily_limit=request.daily_limit,
         message_template=request.message_template,
+        like_post_after_invite=request.like_post_after_invite,
     )
 
     add_log(f"Campaign created: {campaign_id}")

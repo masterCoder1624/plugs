@@ -2,12 +2,12 @@ import asyncio
 import json
 import os
 import random
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from bson import ObjectId
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from pymongo import MongoClient
 
@@ -27,15 +27,10 @@ COL_CAMPAIGNS = "campaigns"
 COL_PROFILES = "people_profiles"
 COL_INVITES = "connection_invites"
 COL_MESSAGES = "messages"
-COL_LIMITS = "daily_limits"
 
 
 def utc_now():
     return datetime.now(timezone.utc)
-
-
-def utc_iso():
-    return utc_now().isoformat()
 
 
 def today_key():
@@ -85,7 +80,6 @@ def first_name_from_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
         return ""
-
     return name.split()[0]
 
 
@@ -95,6 +89,9 @@ def safe_doc(value: Any):
 
     if isinstance(value, dict):
         return {key: safe_doc(val) for key, val in value.items()}
+
+    if isinstance(value, ObjectId):
+        return str(value)
 
     if isinstance(value, datetime):
         return value.isoformat()
@@ -116,7 +113,7 @@ class OutreachService:
         self.stop_requested = False
 
     async def ensure_browser(self):
-        if self.playwright and self.browser and self.context:
+        if self.playwright and self.browser and self.context and self.page:
             return
 
         self.playwright = await async_playwright().start()
@@ -144,30 +141,6 @@ class OutreachService:
 
         self.context = await self.browser.new_context(**kwargs)
         self.page = await self.context.new_page()
-
-    async def close_browser(self):
-        try:
-            if self.context:
-                await self.context.storage_state(path=str(SESSION_FILE))
-        except Exception:
-            pass
-
-        try:
-            if self.browser:
-                await self.browser.close()
-        except Exception:
-            pass
-
-        try:
-            if self.playwright:
-                await self.playwright.stop()
-        except Exception:
-            pass
-
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
 
     async def save_session(self):
         if not self.context:
@@ -240,12 +213,20 @@ class OutreachService:
                 "message": str(error),
             }
 
-    def create_campaign(self, name: str, search_url: str, daily_limit: int, message_template: str | None):
+    def create_campaign(
+        self,
+        name: str,
+        search_url: str,
+        daily_limit: int,
+        message_template: str | None,
+        like_post_after_invite: bool = False,
+    ):
         campaign = {
             "name": name,
             "searchUrl": search_url,
             "dailyLimit": min(max(daily_limit, 1), 10),
             "messageTemplate": message_template or "",
+            "likePostAfterInvite": bool(like_post_after_invite),
             "status": "created",
             "createdAt": utc_now(),
             "updatedAt": utc_now(),
@@ -256,6 +237,17 @@ class OutreachService:
         client.close()
 
         return str(result.inserted_id)
+
+    def get_campaign(self, campaign_id: str):
+        try:
+            client = get_mongo_client()
+            campaign = client[DB_OUTREACH][COL_CAMPAIGNS].find_one({
+                "_id": ObjectId(campaign_id),
+            })
+            client.close()
+            return campaign
+        except Exception:
+            return None
 
     def get_sent_today_count(self, campaign_id: str) -> int:
         client = get_mongo_client()
@@ -292,7 +284,17 @@ class OutreachService:
         )
         client.close()
 
-    def save_invite(self, campaign_id: str, profile: dict, status: str, error: str | None = None):
+    def save_invite(
+        self,
+        campaign_id: str,
+        profile: dict,
+        status: str,
+        error: str | None = None,
+        post_like_enabled: bool = False,
+        post_liked: bool = False,
+        post_like_status: str | None = None,
+        post_like_error: str | None = None,
+    ):
         profile_url = normalize_profile_url(profile.get("profileUrl", ""))
 
         doc = {
@@ -305,6 +307,11 @@ class OutreachService:
             "error": error,
             "dateKey": today_key(),
             "invitedAt": utc_now() if status in ["sent", "already_connected"] else None,
+            "postLikeEnabled": post_like_enabled,
+            "postLiked": post_liked,
+            "postLikedAt": utc_now() if post_liked else None,
+            "postLikeStatus": post_like_status,
+            "postLikeError": post_like_error,
             "updatedAt": utc_now(),
         }
 
@@ -457,6 +464,68 @@ class OutreachService:
 
         return False, "connect_button_not_found"
 
+    async def like_recent_post_on_profile(self, profile_url: str):
+        try:
+            await self.page.goto(profile_url, wait_until="domcontentloaded")
+            await asyncio.sleep(random.uniform(3.0, 5.0))
+
+            await self.page.mouse.wheel(0, 900)
+            await asyncio.sleep(random.uniform(2.0, 3.5))
+
+            buttons = await self.page.query_selector_all("button")
+
+            for button in buttons:
+                try:
+                    aria_label = (await button.get_attribute("aria-label") or "").lower()
+                    text = ""
+
+                    try:
+                        text = (await button.inner_text()).strip().lower()
+                    except Exception:
+                        pass
+
+                    already_liked = "unlike" in aria_label or text == "liked"
+                    is_like_button = (
+                        "react like" in aria_label or
+                        aria_label.startswith("like ") or
+                        text == "like"
+                    )
+
+                    if already_liked:
+                        return {
+                            "liked": False,
+                            "status": "already_liked",
+                            "error": None,
+                        }
+
+                    if is_like_button:
+                        await button.scroll_into_view_if_needed()
+                        await asyncio.sleep(random.uniform(0.8, 1.5))
+                        await button.click()
+                        await asyncio.sleep(random.uniform(1.5, 3.0))
+
+                        return {
+                            "liked": True,
+                            "status": "liked",
+                            "error": None,
+                        }
+
+                except Exception:
+                    continue
+
+            return {
+                "liked": False,
+                "status": "no_post_or_like_button_found",
+                "error": None,
+            }
+
+        except Exception as error:
+            return {
+                "liked": False,
+                "status": "failed",
+                "error": str(error),
+            }
+
     async def start_outreach(self, campaign_id: str, search_url: str, daily_limit: int = 10):
         if self.running:
             return {
@@ -468,6 +537,14 @@ class OutreachService:
         self.stop_requested = False
 
         daily_limit = min(max(daily_limit, 1), 10)
+        campaign = self.get_campaign(campaign_id)
+        like_post_after_invite = bool(campaign.get("likePostAfterInvite")) if campaign else False
+
+        if like_post_after_invite:
+            self.add_log("Post-like after invite is enabled.")
+        else:
+            self.add_log("Post-like after invite is disabled.")
+
         sent_today = self.get_sent_today_count(campaign_id)
         remaining_today = max(daily_limit - sent_today, 0)
 
@@ -516,8 +593,39 @@ class OutreachService:
 
                     if success:
                         sent_count += 1
-                        self.save_invite(campaign_id, person, "sent")
+
+                        post_liked = False
+                        post_like_status = None
+                        post_like_error = None
+
+                        if like_post_after_invite:
+                            self.add_log(f"Trying to like one recent post for {person.get('name', profile_url)}")
+                            like_result = await self.like_recent_post_on_profile(profile_url)
+
+                            post_liked = like_result.get("liked") is True
+                            post_like_status = like_result.get("status")
+                            post_like_error = like_result.get("error")
+
+                            if post_liked:
+                                self.add_log(f"Post liked for {person.get('name', profile_url)}")
+                            else:
+                                self.add_log(
+                                    f"Post like skipped/failed for {person.get('name', profile_url)}: "
+                                    f"{post_like_status}"
+                                )
+
+                        self.save_invite(
+                            campaign_id,
+                            person,
+                            "sent",
+                            post_like_enabled=like_post_after_invite,
+                            post_liked=post_liked,
+                            post_like_status=post_like_status,
+                            post_like_error=post_like_error,
+                        )
+
                         self.add_log(f"Invite sent: {person.get('name', profile_url)}")
+
                     elif status == "possibly_already_connected":
                         skipped_count += 1
                         self.save_invite(campaign_id, person, "already_connected")
@@ -536,7 +644,7 @@ class OutreachService:
 
             client = get_mongo_client()
             client[DB_OUTREACH][COL_CAMPAIGNS].update_one(
-                {"_id": campaign_id},
+                {"_id": ObjectId(campaign_id)},
                 {
                     "$set": {
                         "status": "completed",
@@ -628,7 +736,7 @@ class OutreachService:
     async def send_first_messages(
         self,
         campaign_id: str,
-        message_template: str,
+        message_template: str | None = None,
         confirm_send: bool = False,
         limit: int = 10,
     ):
@@ -636,6 +744,16 @@ class OutreachService:
             return {
                 "ok": False,
                 "message": "Message sending requires confirm_send=true.",
+            }
+
+        campaign = self.get_campaign(campaign_id)
+        if not message_template and campaign:
+            message_template = campaign.get("messageTemplate", "")
+
+        if not message_template:
+            return {
+                "ok": False,
+                "message": "Message template is empty.",
             }
 
         await self.ensure_browser()
@@ -757,6 +875,7 @@ class OutreachService:
                 "dateKey": today_key(),
                 "status": {"$in": ["sent", "already_connected"]},
             }),
+            "postsLiked": invites.count_documents({"campaignId": campaign_id, "postLiked": True}),
         }
 
         client.close()
