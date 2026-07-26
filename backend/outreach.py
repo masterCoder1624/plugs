@@ -150,6 +150,86 @@ class OutreachService:
         await self.context.storage_state(path=str(SESSION_FILE))
         self.add_log("LinkedIn session saved.")
 
+    async def page_text(self) -> str:
+        try:
+            return (await self.page.inner_text("body")).lower()
+        except Exception:
+            return ""
+
+    async def detect_linkedin_warning(self) -> str | None:
+        text = await self.page_text()
+
+        hard_stop_phrases = [
+            "security verification",
+            "verify it's you",
+            "verify it’s you",
+            "quick security check",
+            "captcha",
+            "unusual activity",
+            "temporarily restricted",
+            "account has been restricted",
+            "your account is restricted",
+            "weekly invitation limit",
+            "you’ve reached the weekly invitation limit",
+            "you've reached the weekly invitation limit",
+            "you have reached the weekly invitation limit",
+            "try again later",
+            "we limit how often you can do certain things",
+            "something went wrong",
+        ]
+
+        for phrase in hard_stop_phrases:
+            if phrase in text:
+                return phrase
+
+        return None
+
+    async def should_stop_for_linkedin_warning(self, context: str) -> bool:
+        warning = await self.detect_linkedin_warning()
+
+        if not warning:
+            return False
+
+        self.add_log(f"Safety stop during {context}: LinkedIn warning detected: {warning}")
+        self.stop_requested = True
+        return True
+
+    async def find_button_by_text(self, possible_texts: list[str]):
+        buttons = await self.page.query_selector_all("button")
+
+        for button in buttons:
+            try:
+                text = (await button.inner_text()).strip().lower()
+                aria = (await button.get_attribute("aria-label") or "").strip().lower()
+
+                for wanted in possible_texts:
+                    wanted = wanted.lower()
+
+                    if text == wanted or wanted in aria:
+                        return button
+            except Exception:
+                continue
+
+        return None
+
+    async def close_dialog_if_open(self):
+        close_texts = ["dismiss", "close", "cancel", "not now", "got it"]
+
+        for text in close_texts:
+            button = await self.find_button_by_text([text])
+            if button:
+                try:
+                    await button.click()
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
+                    return True
+                except Exception:
+                    pass
+
+        return False
+
+    async def human_pause(self, min_s=1.5, max_s=3.5):
+        await asyncio.sleep(random.uniform(min_s, max_s))
+
     async def is_logged_in(self) -> bool:
         if not self.page:
             return False
@@ -249,12 +329,31 @@ class OutreachService:
         except Exception:
             return None
 
+    def update_campaign_status(self, campaign_id: str, status: str, error: str | None = None):
+        try:
+            update = {
+                "status": status,
+                "updatedAt": utc_now(),
+            }
+
+            if error:
+                update["error"] = error
+
+            client = get_mongo_client()
+            client[DB_OUTREACH][COL_CAMPAIGNS].update_one(
+                {"_id": ObjectId(campaign_id)},
+                {"$set": update},
+            )
+            client.close()
+        except Exception:
+            pass
+
     def get_sent_today_count(self, campaign_id: str) -> int:
         client = get_mongo_client()
         count = client[DB_OUTREACH][COL_INVITES].count_documents({
             "campaignId": campaign_id,
             "dateKey": today_key(),
-            "status": {"$in": ["sent", "already_connected"]},
+            "status": {"$in": ["sent", "already_connected", "already_pending"]},
         })
         client.close()
         return count
@@ -263,7 +362,7 @@ class OutreachService:
         client = get_mongo_client()
         exists = client[DB_OUTREACH][COL_INVITES].find_one({
             "profileUrl": profile_url,
-            "status": {"$in": ["sent", "accepted", "already_connected"]},
+            "status": {"$in": ["sent", "accepted", "already_connected", "already_pending"]},
         })
         client.close()
         return exists is not None
@@ -306,7 +405,7 @@ class OutreachService:
             "status": status,
             "error": error,
             "dateKey": today_key(),
-            "invitedAt": utc_now() if status in ["sent", "already_connected"] else None,
+            "invitedAt": utc_now() if status in ["sent", "already_connected", "already_pending"] else None,
             "postLikeEnabled": post_like_enabled,
             "postLiked": post_liked,
             "postLikedAt": utc_now() if post_liked else None,
@@ -339,17 +438,51 @@ class OutreachService:
             self.add_log(f"Could not open search URL: {error}")
             return []
 
-        await asyncio.sleep(4)
-        await self.page.mouse.wheel(0, 1200)
-        await asyncio.sleep(2)
+        await self.human_pause(4.0, 6.0)
+
+        for _ in range(3):
+            await self.page.mouse.wheel(0, random.randint(600, 1100))
+            await self.human_pause(1.0, 2.0)
+
+        if await self.should_stop_for_linkedin_warning("people preview"):
+            return []
 
         people = await self.page.evaluate(
             """
             (limit) => {
+                const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+
+                const cleanName = (text) => {
+                    text = normalize(text);
+                    text = text.replace(/^View\\s+/i, '');
+                    text = text.replace(/'s profile$/i, '');
+                    text = text.replace(/’s profile$/i, '');
+                    return text;
+                };
+
                 const results = [];
-                const cards = Array.from(document.querySelectorAll(
-                    'li.reusable-search__result-container, div.entity-result, li[data-chameleon-result-urn]'
-                ));
+                const seen = new Set();
+
+                const cardSelectors = [
+                    'li.reusable-search__result-container',
+                    'div.entity-result',
+                    'li[data-chameleon-result-urn]',
+                    '.reusable-search__result-container',
+                    '[class*="entity-result"]'
+                ];
+
+                let cards = [];
+
+                for (const selector of cardSelectors) {
+                    cards = Array.from(document.querySelectorAll(selector));
+                    if (cards.length) break;
+                }
+
+                if (!cards.length) {
+                    cards = Array.from(document.querySelectorAll('a[href*="/in/"]'))
+                        .map(a => a.closest('li, div'))
+                        .filter(Boolean);
+                }
 
                 for (const card of cards) {
                     if (results.length >= limit) break;
@@ -357,44 +490,66 @@ class OutreachService:
                     const link = card.querySelector('a[href*="/in/"]');
                     if (!link) continue;
 
-                    const profileUrl = link.href.split('?')[0];
+                    const profileUrl = (link.href || '').split('?')[0];
+                    if (!profileUrl || seen.has(profileUrl)) continue;
+                    seen.add(profileUrl);
 
                     let name = '';
+
                     const nameSelectors = [
-                        'span[aria-hidden="true"]',
                         '.entity-result__title-text span[aria-hidden="true"]',
-                        '.app-aware-link span[aria-hidden="true"]'
+                        '.app-aware-link span[aria-hidden="true"]',
+                        'span[aria-hidden="true"]',
+                        '.entity-result__title-text',
+                        'a[href*="/in/"]'
                     ];
 
                     for (const selector of nameSelectors) {
                         const el = card.querySelector(selector);
-                        if (el && el.innerText.trim()) {
-                            name = el.innerText.trim().replace(/\\s+/g, ' ');
+                        const candidate = cleanName(el ? el.innerText : '');
+                        if (
+                            candidate &&
+                            candidate.length <= 80 &&
+                            !candidate.toLowerCase().includes('linkedin member') &&
+                            !candidate.toLowerCase().includes('view profile')
+                        ) {
+                            name = candidate;
                             break;
                         }
                     }
 
                     if (!name) {
-                        name = (link.innerText || '').trim().replace(/\\s+/g, ' ');
+                        name = cleanName(link.getAttribute('aria-label') || link.innerText || '');
                     }
 
                     const headlineEl = card.querySelector(
-                        '.entity-result__primary-subtitle, [class*="primary-subtitle"]'
+                        '.entity-result__primary-subtitle, [class*="primary-subtitle"], [class*="subtitle"]'
                     );
 
                     const locationEl = card.querySelector(
                         '.entity-result__secondary-subtitle, [class*="secondary-subtitle"]'
                     );
 
-                    const connectButton = Array.from(card.querySelectorAll('button'))
-                        .find(btn => (btn.innerText || '').trim().toLowerCase() === 'connect');
+                    const buttons = Array.from(card.querySelectorAll('button'));
+                    const connectButton = buttons.find(btn => {
+                        const text = normalize(btn.innerText).toLowerCase();
+                        const aria = normalize(btn.getAttribute('aria-label')).toLowerCase();
+                        return text === 'connect' || aria.includes('connect') || aria.includes('invite');
+                    });
+
+                    const pendingButton = buttons.find(btn => {
+                        const text = normalize(btn.innerText).toLowerCase();
+                        const aria = normalize(btn.getAttribute('aria-label')).toLowerCase();
+                        return text === 'pending' || aria.includes('pending');
+                    });
 
                     results.push({
                         name,
-                        headline: headlineEl ? headlineEl.innerText.trim().replace(/\\s+/g, ' ') : '',
-                        location: locationEl ? locationEl.innerText.trim().replace(/\\s+/g, ' ') : '',
+                        headline: headlineEl ? normalize(headlineEl.innerText) : '',
+                        location: locationEl ? normalize(locationEl.innerText) : '',
                         profileUrl,
                         canConnect: Boolean(connectButton),
+                        isPending: Boolean(pendingButton),
                     });
                 }
 
@@ -423,54 +578,87 @@ class OutreachService:
         return cleaned
 
     async def click_connect_for_profile(self, profile_url: str):
-        buttons = await self.page.query_selector_all("button")
+        if await self.should_stop_for_linkedin_warning("before connect"):
+            return False, "linkedin_safety_stop"
 
-        for button in buttons:
-            try:
-                text = (await button.inner_text()).strip().lower()
-                if text != "connect":
-                    continue
+        await self.human_pause(2.0, 4.0)
 
-                await button.click()
-                await asyncio.sleep(random.uniform(1.5, 3.0))
+        connect_button = await self.find_button_by_text(["connect"])
 
-                send_buttons = await self.page.query_selector_all("button")
-                for send_button in send_buttons:
-                    send_text = (await send_button.inner_text()).strip().lower()
-                    if send_text in ["send", "send now"]:
-                        await send_button.click()
-                        await asyncio.sleep(random.uniform(1.5, 3.0))
-                        return True, "sent"
+        if not connect_button:
+            more_button = await self.find_button_by_text(["more"])
+            if more_button:
+                try:
+                    await more_button.click()
+                    await self.human_pause(1.0, 2.0)
+                    connect_button = await self.find_button_by_text(["connect"])
+                except Exception:
+                    pass
 
-                dismiss_buttons = await self.page.query_selector_all("button")
-                for dismiss_button in dismiss_buttons:
-                    dismiss_text = (await dismiss_button.inner_text()).strip().lower()
-                    if dismiss_text in ["dismiss", "close", "cancel"]:
-                        await dismiss_button.click()
-                        break
+        if not connect_button:
+            body_text = await self.page_text()
 
-                return False, "send_button_not_found"
-            except Exception:
-                continue
+            if "pending" in body_text:
+                return False, "already_pending"
 
-        body_text = ""
+            if "message" in body_text and ("1st" in body_text or "1st degree" in body_text):
+                return False, "possibly_already_connected"
+
+            return False, "connect_button_not_found"
+
         try:
-            body_text = (await self.page.inner_text("body")).lower()
-        except Exception:
-            pass
+            await connect_button.scroll_into_view_if_needed()
+            await self.human_pause(0.8, 1.5)
+            await connect_button.click()
+            await self.human_pause(1.5, 3.0)
+        except Exception as error:
+            return False, f"connect_click_failed:{error}"
 
-        if "message" in body_text and "connect" not in body_text:
-            return False, "possibly_already_connected"
+        if await self.should_stop_for_linkedin_warning("after connect click"):
+            return False, "linkedin_safety_stop"
 
-        return False, "connect_button_not_found"
+        send_button = await self.find_button_by_text(["send", "send now"])
+
+        if send_button:
+            try:
+                await send_button.click()
+                await self.human_pause(1.5, 3.0)
+                return True, "sent"
+            except Exception as error:
+                return False, f"send_click_failed:{error}"
+
+        body_text = await self.page_text()
+
+        if "invitation sent" in body_text or "pending" in body_text:
+            return True, "sent"
+
+        await self.close_dialog_if_open()
+
+        return False, "send_button_not_found"
 
     async def like_recent_post_on_profile(self, profile_url: str):
         try:
-            await self.page.goto(profile_url, wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(3.0, 5.0))
+            recent_activity_url = profile_url.rstrip("/") + "/recent-activity/all/"
 
-            await self.page.mouse.wheel(0, 900)
-            await asyncio.sleep(random.uniform(2.0, 3.5))
+            self.add_log(f"Opening recent activity: {recent_activity_url}")
+
+            try:
+                await self.page.goto(recent_activity_url, wait_until="domcontentloaded")
+            except Exception:
+                await self.page.goto(profile_url, wait_until="domcontentloaded")
+
+            await self.human_pause(4.0, 6.0)
+
+            for _ in range(3):
+                await self.page.mouse.wheel(0, random.randint(700, 1200))
+                await self.human_pause(1.0, 2.0)
+
+            if await self.should_stop_for_linkedin_warning("post like"):
+                return {
+                    "liked": False,
+                    "status": "linkedin_safety_stop",
+                    "error": None,
+                }
 
             buttons = await self.page.query_selector_all("button")
 
@@ -484,38 +672,40 @@ class OutreachService:
                     except Exception:
                         pass
 
-                    already_liked = "unlike" in aria_label or text == "liked"
-                    is_like_button = (
-                        "react like" in aria_label or
-                        aria_label.startswith("like ") or
-                        text == "like"
-                    )
-
-                    if already_liked:
+                    if "unlike" in aria_label or text == "liked":
                         return {
                             "liked": False,
                             "status": "already_liked",
                             "error": None,
                         }
 
-                    if is_like_button:
-                        await button.scroll_into_view_if_needed()
-                        await asyncio.sleep(random.uniform(0.8, 1.5))
-                        await button.click()
-                        await asyncio.sleep(random.uniform(1.5, 3.0))
+                    is_like_button = (
+                        aria_label.startswith("react like") or
+                        aria_label.startswith("like ") or
+                        aria_label == "like" or
+                        text == "like"
+                    )
 
-                        return {
-                            "liked": True,
-                            "status": "liked",
-                            "error": None,
-                        }
+                    if not is_like_button:
+                        continue
+
+                    await button.scroll_into_view_if_needed()
+                    await self.human_pause(1.0, 2.0)
+                    await button.click()
+                    await self.human_pause(2.0, 3.5)
+
+                    return {
+                        "liked": True,
+                        "status": "liked",
+                        "error": None,
+                    }
 
                 except Exception:
                     continue
 
             return {
                 "liked": False,
-                "status": "no_post_or_like_button_found",
+                "status": "no_recent_post_or_like_button_found",
                 "error": None,
             }
 
@@ -540,6 +730,8 @@ class OutreachService:
         campaign = self.get_campaign(campaign_id)
         like_post_after_invite = bool(campaign.get("likePostAfterInvite")) if campaign else False
 
+        self.update_campaign_status(campaign_id, "running")
+
         if like_post_after_invite:
             self.add_log("Post-like after invite is enabled.")
         else:
@@ -548,48 +740,80 @@ class OutreachService:
         sent_today = self.get_sent_today_count(campaign_id)
         remaining_today = max(daily_limit - sent_today, 0)
 
-        self.add_log(f"Daily invite limit: {daily_limit}")
-        self.add_log(f"Already sent today: {sent_today}")
+        self.add_log(f"Daily invite limit selected by user: {daily_limit}")
+        self.add_log(f"Already counted today: {sent_today}")
         self.add_log(f"Remaining today: {remaining_today}")
 
         if remaining_today <= 0:
             self.running = False
+            self.update_campaign_status(campaign_id, "daily_limit_reached")
             return {
                 "ok": True,
                 "message": "Daily invite limit already reached.",
                 "sent": 0,
+                "skipped": 0,
+                "failed": 0,
             }
 
         sent_count = 0
         skipped_count = 0
         failed_count = 0
+        stop_reason = None
 
         try:
             people = await self.preview_people(search_url, campaign_id=campaign_id, limit=50)
 
+            if self.stop_requested:
+                stop_reason = "Safety stop during preview."
+                self.update_campaign_status(campaign_id, "stopped", stop_reason)
+                return {
+                    "ok": False,
+                    "message": stop_reason,
+                    "sent": sent_count,
+                    "skipped": skipped_count,
+                    "failed": failed_count,
+                }
+
             for person in people:
                 if self.stop_requested:
-                    self.add_log("Stop requested. Outreach stopped.")
+                    stop_reason = "Outreach stopped."
+                    self.add_log(stop_reason)
                     break
 
                 if sent_count >= remaining_today:
-                    self.add_log("Daily invite limit reached.")
+                    stop_reason = "Daily invite limit reached."
+                    self.add_log(stop_reason)
                     break
 
                 profile_url = person["profileUrl"]
 
                 if self.already_invited(profile_url):
                     skipped_count += 1
+                    self.save_invite(campaign_id, person, "skipped_already_invited")
                     self.add_log(f"Skipped already invited: {person.get('name', profile_url)}")
+                    continue
+
+                if person.get("isPending") is True:
+                    skipped_count += 1
+                    self.save_invite(campaign_id, person, "already_pending")
+                    self.add_log(f"Skipped pending invite: {person.get('name', profile_url)}")
                     continue
 
                 self.add_log(f"Opening profile: {person.get('name', profile_url)}")
 
                 try:
                     await self.page.goto(profile_url, wait_until="domcontentloaded")
-                    await asyncio.sleep(random.uniform(3.0, 5.5))
+                    await self.human_pause(3.0, 5.5)
+
+                    if await self.should_stop_for_linkedin_warning("profile open"):
+                        stop_reason = "Safety stop after opening profile."
+                        break
 
                     success, status = await self.click_connect_for_profile(profile_url)
+
+                    if self.stop_requested or status == "linkedin_safety_stop":
+                        stop_reason = "Safety stop during connect flow."
+                        break
 
                     if success:
                         sent_count += 1
@@ -605,6 +829,9 @@ class OutreachService:
                             post_liked = like_result.get("liked") is True
                             post_like_status = like_result.get("status")
                             post_like_error = like_result.get("error")
+
+                            if self.stop_requested or post_like_status == "linkedin_safety_stop":
+                                stop_reason = "Safety stop during post-like flow."
 
                             if post_liked:
                                 self.add_log(f"Post liked for {person.get('name', profile_url)}")
@@ -626,37 +853,44 @@ class OutreachService:
 
                         self.add_log(f"Invite sent: {person.get('name', profile_url)}")
 
+                        if stop_reason:
+                            break
+
                     elif status == "possibly_already_connected":
                         skipped_count += 1
                         self.save_invite(campaign_id, person, "already_connected")
-                        self.add_log(f"Already connected or no invite needed: {person.get('name', profile_url)}")
+                        self.add_log(f"Skipped already connected: {person.get('name', profile_url)}")
+
+                    elif status == "already_pending":
+                        skipped_count += 1
+                        self.save_invite(campaign_id, person, "already_pending")
+                        self.add_log(f"Skipped already pending: {person.get('name', profile_url)}")
+
+                    elif status == "connect_button_not_found":
+                        skipped_count += 1
+                        self.save_invite(campaign_id, person, "skipped_no_connect_button")
+                        self.add_log(f"Skipped no Connect button: {person.get('name', profile_url)}")
+
                     else:
                         failed_count += 1
                         self.save_invite(campaign_id, person, "failed", status)
                         self.add_log(f"Invite failed for {person.get('name', profile_url)}: {status}")
 
-                    await asyncio.sleep(random.uniform(12.0, 25.0))
+                    await self.human_pause(12.0, 25.0)
 
                 except Exception as error:
                     failed_count += 1
                     self.save_invite(campaign_id, person, "failed", str(error))
                     self.add_log(f"Error inviting {person.get('name', profile_url)}: {error}")
 
-            client = get_mongo_client()
-            client[DB_OUTREACH][COL_CAMPAIGNS].update_one(
-                {"_id": ObjectId(campaign_id)},
-                {
-                    "$set": {
-                        "status": "completed",
-                        "updatedAt": utc_now(),
-                    }
-                },
-            )
-            client.close()
+            if stop_reason:
+                self.update_campaign_status(campaign_id, "stopped", stop_reason)
+            else:
+                self.update_campaign_status(campaign_id, "completed")
 
             return {
                 "ok": True,
-                "message": "Outreach completed.",
+                "message": stop_reason or "Outreach completed.",
                 "sent": sent_count,
                 "skipped": skipped_count,
                 "failed": failed_count,
@@ -695,13 +929,23 @@ class OutreachService:
 
             try:
                 await self.page.goto(profile_url, wait_until="domcontentloaded")
-                await asyncio.sleep(random.uniform(3.0, 5.0))
+                await self.human_pause(3.0, 5.0)
 
-                body_text = (await self.page.inner_text("body")).lower()
+                if await self.should_stop_for_linkedin_warning("accepted check"):
+                    break
+
+                body_text = await self.page_text()
+                message_button = await self.find_button_by_text(["message"])
+                connect_button = await self.find_button_by_text(["connect"])
 
                 accepted = (
-                    "message" in body_text and
-                    ("1st" in body_text or "1st degree" in body_text or "connection" in body_text)
+                    message_button is not None and
+                    connect_button is None and
+                    (
+                        "1st" in body_text or
+                        "1st degree" in body_text or
+                        "message" in body_text
+                    )
                 )
 
                 if accepted:
@@ -721,8 +965,10 @@ class OutreachService:
                     client.close()
 
                     self.add_log(f"Accepted: {name}")
+                else:
+                    self.add_log(f"Not accepted yet: {name}")
 
-                await asyncio.sleep(random.uniform(8.0, 15.0))
+                await self.human_pause(8.0, 15.0)
 
             except Exception as error:
                 self.add_log(f"Could not check {name}: {error}")
@@ -782,77 +1028,85 @@ class OutreachService:
 
             try:
                 await self.page.goto(profile_url, wait_until="domcontentloaded")
-                await asyncio.sleep(random.uniform(3.0, 5.0))
+                await self.human_pause(3.0, 5.0)
 
-                buttons = await self.page.query_selector_all("button")
-                message_clicked = False
+                if await self.should_stop_for_linkedin_warning("message sending"):
+                    break
 
-                for button in buttons:
-                    text = (await button.inner_text()).strip().lower()
-                    if text == "message":
-                        await button.click()
-                        message_clicked = True
-                        break
+                message_button = await self.find_button_by_text(["message"])
 
-                if not message_clicked:
+                if not message_button:
                     failed_count += 1
                     self.add_log(f"Message button not found for {name}")
                     continue
 
-                await asyncio.sleep(2)
+                await message_button.click()
+                await self.human_pause(2.0, 3.0)
 
-                editor = await self.page.query_selector('[contenteditable="true"]')
+                editor = None
+
+                editor_selectors = [
+                    'div[contenteditable="true"]',
+                    '[role="textbox"]',
+                    '.msg-form__contenteditable',
+                ]
+
+                for selector in editor_selectors:
+                    editor = await self.page.query_selector(selector)
+                    if editor:
+                        break
+
                 if not editor:
                     failed_count += 1
                     self.add_log(f"Message editor not found for {name}")
+                    await self.close_dialog_if_open()
                     continue
 
-                await editor.fill(message)
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                await editor.click()
+                await self.page.keyboard.type(message, delay=random.randint(25, 80))
+                await self.human_pause(1.0, 2.0)
 
-                send_buttons = await self.page.query_selector_all("button")
-                sent = False
+                send_button = await self.find_button_by_text(["send"])
 
-                for button in send_buttons:
-                    text = (await button.inner_text()).strip().lower()
-                    if text == "send":
-                        await button.click()
-                        sent = True
-                        break
-
-                if sent:
-                    sent_count += 1
-
-                    client = get_mongo_client()
-                    client[DB_OUTREACH][COL_INVITES].update_one(
-                        {"_id": invite["_id"]},
-                        {
-                            "$set": {
-                                "messageSent": True,
-                                "messageSentAt": utc_now(),
-                                "updatedAt": utc_now(),
-                            }
-                        },
-                    )
-                    client[DB_OUTREACH][COL_MESSAGES].insert_one({
-                        "campaignId": campaign_id,
-                        "profileUrl": profile_url,
-                        "name": name,
-                        "message": message,
-                        "sentAt": utc_now(),
-                    })
-                    client.close()
-
-                    self.add_log(f"Message sent to {name}")
-                else:
+                if not send_button:
                     failed_count += 1
                     self.add_log(f"Send button not found for {name}")
+                    await self.close_dialog_if_open()
+                    continue
 
-                await asyncio.sleep(random.uniform(15.0, 30.0))
+                await send_button.click()
+                await self.human_pause(2.0, 3.0)
+
+                sent_count += 1
+
+                client = get_mongo_client()
+                client[DB_OUTREACH][COL_INVITES].update_one(
+                    {"_id": invite["_id"]},
+                    {
+                        "$set": {
+                            "messageSent": True,
+                            "messageSentAt": utc_now(),
+                            "updatedAt": utc_now(),
+                        }
+                    },
+                )
+                client[DB_OUTREACH][COL_MESSAGES].insert_one({
+                    "campaignId": campaign_id,
+                    "profileUrl": profile_url,
+                    "name": name,
+                    "message": message,
+                    "sentAt": utc_now(),
+                })
+                client.close()
+
+                self.add_log(f"Message sent to {name}")
+
+                await self.human_pause(15.0, 30.0)
 
             except Exception as error:
                 failed_count += 1
                 self.add_log(f"Message failed for {name}: {error}")
+                await self.close_dialog_if_open()
 
         return {
             "ok": True,
@@ -869,11 +1123,14 @@ class OutreachService:
             "accepted": invites.count_documents({"campaignId": campaign_id, "status": "accepted"}),
             "failed": invites.count_documents({"campaignId": campaign_id, "status": "failed"}),
             "alreadyConnected": invites.count_documents({"campaignId": campaign_id, "status": "already_connected"}),
+            "alreadyPending": invites.count_documents({"campaignId": campaign_id, "status": "already_pending"}),
+            "skippedNoConnect": invites.count_documents({"campaignId": campaign_id, "status": "skipped_no_connect_button"}),
+            "skippedAlreadyInvited": invites.count_documents({"campaignId": campaign_id, "status": "skipped_already_invited"}),
             "messagesSent": invites.count_documents({"campaignId": campaign_id, "messageSent": True}),
             "sentToday": invites.count_documents({
                 "campaignId": campaign_id,
                 "dateKey": today_key(),
-                "status": {"$in": ["sent", "already_connected"]},
+                "status": {"$in": ["sent", "already_connected", "already_pending"]},
             }),
             "postsLiked": invites.count_documents({"campaignId": campaign_id, "postLiked": True}),
         }
