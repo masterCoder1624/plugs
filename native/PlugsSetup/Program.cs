@@ -41,7 +41,7 @@ try
         : null;
 
     Console.WriteLine("[1/5] Reading latest version...");
-    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+    using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
     http.DefaultRequestHeaders.UserAgent.ParseAdd("PlugsSetup/0.1.0");
     var manifest = await ReadManifestAsync(http);
 
