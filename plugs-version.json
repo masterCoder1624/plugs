@@ -1,6 +1,6 @@
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "downloadUrl": "https://github.com/masterCoder1624/plugs/releases/download/v0.2.0/plugs-windows.zip",
-  "sha256": "1FB707F6F2369DAB787C0A8C13B8A2D33E84D27E097041C5F994CA1DB090440A",
-  "notes": "LinkedIn outreach assistant release."
+  "sha256": "F447172E722DD942EC440953538DE515D8FC0294C482D15BDD62FCEF54DBDE2B",
+  "notes": "Versioned installer update flow with local AI engine."
 }
