@@ -19,8 +19,24 @@ BACKEND_DIR = (
 )
 
 ROOT_DIR = BACKEND_DIR.parent
-CONFIG_FILE = ROOT_DIR / "config" / "config.json"
-SESSION_FILE = ROOT_DIR / "config" / "linkedin_session.json"
+
+DEFAULT_USER_DATA_DIR = (
+    Path(os.environ["PLUGS_USER_DATA_DIR"]).resolve()
+    if os.environ.get("PLUGS_USER_DATA_DIR")
+    else ROOT_DIR / "config"
+)
+
+CONFIG_FILE = (
+    Path(os.environ["PLUGS_CONFIG_FILE"]).resolve()
+    if os.environ.get("PLUGS_CONFIG_FILE")
+    else DEFAULT_USER_DATA_DIR / "config.json"
+)
+
+SESSION_FILE = (
+    Path(os.environ["PLUGS_LINKEDIN_SESSION_FILE"]).resolve()
+    if os.environ.get("PLUGS_LINKEDIN_SESSION_FILE")
+    else DEFAULT_USER_DATA_DIR / "linkedin_session.json"
+)
 
 DB_OUTREACH = "plugs_outreach"
 COL_CAMPAIGNS = "campaigns"

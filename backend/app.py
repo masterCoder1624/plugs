@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from outreach import OutreachService, get_mongo_client, safe_doc
-
+from chatbot import ask_local_ai, local_ai_status
 
 app = FastAPI(title="Plugs Outreach Backend", version="0.2.0")
 
@@ -70,6 +70,14 @@ class SendMessageRequest(BaseModel):
     confirm_send: bool = False
     limit: int = 10
 
+class ChatMessageItem(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[ChatMessageItem] = []
 
 def json_safe(value: Any):
     return safe_doc(value)
@@ -310,6 +318,27 @@ def campaign_profiles(campaign_id: str, limit: int = 100):
         "profiles": json_safe(docs),
     }
 
+@app.get("/chatbot/status")
+async def chatbot_status():
+    return await local_ai_status()
+
+
+@app.post("/chatbot/message")
+async def chatbot_message(request: ChatRequest):
+    history = [
+        {
+            "role": item.role,
+            "content": item.content,
+        }
+        for item in request.history
+    ]
+
+    result = await ask_local_ai(
+        message=request.message,
+        history=history,
+    )
+
+    return result
 
 if __name__ == "__main__":
     import uvicorn

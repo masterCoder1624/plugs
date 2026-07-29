@@ -4,7 +4,11 @@ using System.Net;
 const string BackendHost = "127.0.0.1";
 const int BackendPort = 8000;
 
-var appRoot = AppContext.BaseDirectory;
+var launcherDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+var appRoot = ResolveAppRoot(launcherDir);
+var installRoot = ResolveInstallRoot(launcherDir, appRoot);
+var userDataDir = Path.Combine(installRoot, "user-data");
+
 var backendExe = Path.Combine(appRoot, "backend", "plugs-backend.exe");
 var flutterExe = Path.Combine(appRoot, "flutter", "Plugs.exe");
 var browsersDir = Path.Combine(appRoot, "browsers");
@@ -16,6 +20,10 @@ var shuttingDown = false;
 
 try
 {
+    Directory.CreateDirectory(userDataDir);
+    Directory.CreateDirectory(Path.Combine(userDataDir, "logs"));
+    Directory.CreateDirectory(Path.Combine(userDataDir, "cache"));
+
     if (!File.Exists(backendExe))
     {
         throw new FileNotFoundException("Backend executable was not found.", backendExe);
@@ -28,7 +36,7 @@ try
 
     backendProcess = StartProcess(backendExe, Path.GetDirectoryName(backendExe)!, configureEnvironment: true);
 
-    await WaitForHealthAsync(healthUrl, TimeSpan.FromSeconds(30));
+    await WaitForHealthAsync(healthUrl, TimeSpan.FromSeconds(45));
 
     flutterProcess = StartProcess(flutterExe, Path.GetDirectoryName(flutterExe)!, configureEnvironment: false);
     flutterProcess.WaitForExit();
@@ -41,6 +49,52 @@ catch (Exception error)
     Shutdown(1);
 }
 
+string ResolveAppRoot(string launcherDirectory)
+{
+    var currentPath = Path.Combine(launcherDirectory, "current.txt");
+    var versionsDir = Path.Combine(launcherDirectory, "versions");
+
+    if (File.Exists(currentPath) && Directory.Exists(versionsDir))
+    {
+        var version = File.ReadAllText(currentPath).Trim();
+        var versionRoot = Path.Combine(versionsDir, version);
+        var nestedPlugsRoot = Path.Combine(versionRoot, "plugs");
+
+        if (Directory.Exists(nestedPlugsRoot))
+        {
+            return nestedPlugsRoot;
+        }
+
+        return versionRoot;
+    }
+
+    return launcherDirectory;
+}
+
+string ResolveInstallRoot(string launcherDirectory, string resolvedAppRoot)
+{
+    if (File.Exists(Path.Combine(launcherDirectory, "current.txt")))
+    {
+        return launcherDirectory;
+    }
+
+    var current = new DirectoryInfo(resolvedAppRoot);
+
+    while (current is not null)
+    {
+        if (Directory.Exists(Path.Combine(current.FullName, "user-data")) ||
+            Directory.Exists(Path.Combine(current.FullName, "versions")) ||
+            File.Exists(Path.Combine(current.FullName, "current.txt")))
+        {
+            return current.FullName;
+        }
+
+        current = current.Parent;
+    }
+
+    return launcherDirectory;
+}
+
 Process StartProcess(string fileName, string workingDirectory, bool configureEnvironment)
 {
     var startInfo = new ProcessStartInfo
@@ -48,6 +102,9 @@ Process StartProcess(string fileName, string workingDirectory, bool configureEnv
         FileName = fileName,
         WorkingDirectory = workingDirectory,
         UseShellExecute = false,
+        CreateNoWindow = configureEnvironment,
+        RedirectStandardOutput = configureEnvironment,
+        RedirectStandardError = configureEnvironment,
     };
 
     if (configureEnvironment && Directory.Exists(browsersDir))
@@ -57,6 +114,12 @@ Process StartProcess(string fileName, string workingDirectory, bool configureEnv
 
     startInfo.Environment["PLUGS_BACKEND_HOST"] = BackendHost;
     startInfo.Environment["PLUGS_BACKEND_PORT"] = BackendPort.ToString();
+
+    startInfo.Environment["PLUGS_INSTALL_DIR"] = installRoot;
+    startInfo.Environment["PLUGS_USER_DATA_DIR"] = userDataDir;
+    startInfo.Environment["PLUGS_CONFIG_FILE"] = Path.Combine(userDataDir, "config.json");
+    startInfo.Environment["PLUGS_LINKEDIN_SESSION_FILE"] = Path.Combine(userDataDir, "linkedin_session.json");
+    startInfo.Environment["PLUGS_LOGS_DIR"] = Path.Combine(userDataDir, "logs");
 
     return Process.Start(startInfo)
         ?? throw new InvalidOperationException($"Could not start {fileName}");

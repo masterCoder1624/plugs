@@ -60,6 +60,7 @@ class _OutreachChatScreenState extends State<OutreachChatScreen> {
 
   Timer? pollTimer;
 
+  bool localAiReady = false;
   bool backendReady = false;
   bool linkedInConnected = false;
   bool loading = false;
@@ -97,6 +98,7 @@ class _OutreachChatScreenState extends State<OutreachChatScreen> {
     bot('First, I will check if the backend is running.');
 
     checkBackend();
+    checkLocalAiStatus();
 
     pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       refreshProgress();
@@ -160,6 +162,7 @@ class _OutreachChatScreenState extends State<OutreachChatScreen> {
 
         bot('Backend is connected.');
         await checkLinkedInStatus();
+        await checkLocalAiStatus();
       } else {
         setState(() {
           backendReady = false;
@@ -175,6 +178,76 @@ class _OutreachChatScreenState extends State<OutreachChatScreen> {
       });
 
       bot('Backend is not running. Please start the launcher first.');
+    } finally {
+      setState(() {
+        loading = false;
+      });
+    }
+  }
+
+  Future<void> checkLocalAiStatus() async {
+    if (!backendReady) return;
+
+    try {
+      final response = await http.get(Uri.parse('$backendUrl/chatbot/status'));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+
+        setState(() {
+          localAiReady = data['ready'] == true;
+        });
+
+        if (localAiReady) {
+          bot('Local AI chatbot is ready.');
+        } else {
+          bot('Local AI chatbot is still getting ready. You can continue using outreach features.');
+        }
+      }
+    } catch (_) {
+      setState(() {
+        localAiReady = false;
+      });
+    }
+  }
+  Future<void> sendChatbotMessage(String text) async {
+    if (!backendReady) {
+      bot('Backend is not ready yet.');
+      return;
+    }
+
+    setState(() {
+      loading = true;
+    });
+
+    try {
+      final history = messages
+          .where((message) => message.text.trim().isNotEmpty)
+          .take(12)
+          .map((message) {
+        return {
+          'role': message.sender == Sender.user ? 'user' : 'assistant',
+          'content': message.text,
+        };
+      }).toList();
+
+      final response = await http.post(
+        Uri.parse('$backendUrl/chatbot/message'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'message': text,
+          'history': history,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        bot(data['reply'] ?? 'Local AI chatbot did not return a response.');
+      } else {
+        bot('Local AI chatbot error: ${response.body}');
+      }
+    } catch (error) {
+      bot('Local AI chatbot is not ready yet: $error');
     } finally {
       setState(() {
         loading = false;
@@ -556,7 +629,7 @@ class _OutreachChatScreenState extends State<OutreachChatScreen> {
     user(text);
     inputController.clear();
 
-    bot('I received your message. For now, paste a LinkedIn people-search URL or use the action buttons.');
+    sendChatbotMessage(text);
   }
 
   @override
