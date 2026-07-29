@@ -221,15 +221,7 @@ class _OutreachChatScreenState extends State<OutreachChatScreen> {
     });
 
     try {
-      final history = messages
-          .where((message) => message.text.trim().isNotEmpty)
-          .take(12)
-          .map((message) {
-        return {
-          'role': message.sender == Sender.user ? 'user' : 'assistant',
-          'content': message.text,
-        };
-      }).toList();
+      final history = <Map<String, String>>[];
 
       final response = await http.post(
         Uri.parse('$backendUrl/chatbot/message'),
