@@ -1,6 +1,6 @@
 {
-  "version": "0.3.0",
-  "downloadUrl": "https://github.com/masterCoder1624/plugs/releases/download/v0.3.0/plugs-windows.zip",
-  "sha256": "BDD9950B03908003FF5F318134C6B8B1838528DE4AB8E880AB5020A6C4FC380C",
-  "notes": "Versioned installer update flow with local AI engine."
+  "version": "0.3.1",
+  "downloadUrl": "https://github.com/masterCoder1624/plugs/releases/download/v0.3.1/plugs-windows.zip",
+  "sha256": "A9375D16CF81EDADEDD23B8426B7FA26DE8D9B909F94A8116A915F2423F24D7D",
+  "notes": "Improve local AI chatbot outreach responses."
 }
